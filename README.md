@@ -1,1 +1,1 @@
-# Snakemake-cli-dashboard
+# CLI Dashboard for Snakemake 
