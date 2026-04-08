@@ -22,6 +22,6 @@ smk-dash run -- snakemake --profile slurm -j 100 --use-envmodules
 
 <br>
 
-<img src="./images/rule_breakdown.png" alt="rule-break" width="500"/>
+<img src="./images/rule_breakdown.png" alt="rule-break" width="400" align="center"/>
 
 </center>
