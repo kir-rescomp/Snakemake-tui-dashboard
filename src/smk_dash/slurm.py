@@ -77,14 +77,14 @@ async def fetch_partition_defaults() -> dict[str, PartitionDefaults]:
 
             elif k == "DefMemPerCPU" and v not in ("NONE", ""):
                 try:
-                    # scontrol reports in KB
-                    current.default_mem_mb = int(v) // 1024
+                    # scontrol reports in MB
+                    current.default_mem_mb = int(v) 
                 except ValueError:
                     pass
 
             elif k == "DefMemPerNode" and v not in ("NONE", "") and current.default_mem_mb == 0:
                 try:
-                    current.default_mem_mb = int(v) // 1024
+                    current.default_mem_mb = int(v)
                 except ValueError:
                     pass
 
