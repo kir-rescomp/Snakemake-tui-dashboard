@@ -7,10 +7,11 @@ Layout (approximate):
   ├────────────────────┬─────────────────────────────────────────────┤
   │ OverviewPanel      │ SlurmJobsPanel                              │
   │  progress bar      │  scrollable live job table                  │
-  │  counters          ├─────────────────────────────────────────────┤
-  ├────────────────────┤ ResourcePanel                               │
-  │ RuleTablePanel     │  CPU / Mem gauges                           │
-  │  per-rule D/R/P/F  │                                             │
+  │  counters          │  (CPUs / Mem / Timelimit flagged if         │
+  ├────────────────────┤   they match partition defaults)            │
+  │ RuleTablePanel     ├─────────────────────────────────────────────┤
+  │  per-rule D/R/P/F  │ ResourcePanel                               │
+  │                    │  CPU / Mem gauges                           │
   ├────────────────────┴─────────────────────────────────────────────┤
   │ LogPanel  (scrolling tail, last 200 lines)                       │
   └──────────────────────────────────────────────────────────────────┘
@@ -18,28 +19,25 @@ Layout (approximate):
 from __future__ import annotations
 
 import asyncio
-import time
 from pathlib import Path
 from typing import Optional
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical, ScrollableContainer
+from textual.containers import Horizontal, Vertical
 from textual.widgets import (
     DataTable,
     Footer,
     Header,
     Label,
     Log,
-    ProgressBar,
-    Rule,
     Static,
 )
 from textual import work
 
 from .models import WorkflowState
 from .watcher import LogWatcher
-from .slurm import SlurmPoller
+from .slurm import SlurmPoller, PartitionDefaults
 
 # ── colour constants ──────────────────────────────────────────────────────────
 
@@ -52,6 +50,38 @@ _STATE_STYLE = {
     "TIMEOUT":    "red",
     "COMPLETED":  "dim",
 }
+
+
+# ── resource-warning helpers ──────────────────────────────────────────────────
+
+def _cpus_is_default(cpus: int) -> bool:
+    """1 CPU is virtually always the SLURM default; flag it."""
+    return cpus == 1
+
+
+def _mem_is_default(mem_mb: int, partition: str, defaults: dict[str, PartitionDefaults]) -> bool:
+    """True if mem_mb is within 10% of the partition's configured default."""
+    pd = defaults.get(partition)
+    if pd is None or pd.default_mem_mb == 0 or mem_mb == 0:
+        return False
+    return abs(mem_mb - pd.default_mem_mb) / pd.default_mem_mb < 0.10
+
+
+def _timelimit_is_default(
+    time_limit_secs: int, partition: str, defaults: dict[str, PartitionDefaults]
+) -> bool:
+    """True if time_limit_secs matches the partition's default within 60 s."""
+    pd = defaults.get(partition)
+    if pd is None or pd.default_time_secs == 0 or time_limit_secs == 0:
+        return False
+    return abs(time_limit_secs - pd.default_time_secs) < 60
+
+
+def _warn_cell(value: str, is_default: bool) -> str:
+    """Wrap a cell value in yellow with a warning glyph if flagged."""
+    if is_default:
+        return f"[yellow]{value} ⚠[/]"
+    return value
 
 
 # ── individual panels ─────────────────────────────────────────────────────────
@@ -141,10 +171,10 @@ class RuleTablePanel(Static):
         for rule in sorted(state.rules.values(), key=lambda r: r.name):
             dt.add_row(
                 rule.name,
-                f"[green]{rule.done}[/]"  if rule.done    else "[dim]·[/]",
+                f"[green]{rule.done}[/]"    if rule.done    else "[dim]·[/]",
                 f"[yellow]{rule.running}[/]" if rule.running else "[dim]·[/]",
-                str(rule.pending)          if rule.pending else "[dim]·[/]",
-                f"[red]{rule.failed}[/]"  if rule.failed  else "[dim]·[/]",
+                str(rule.pending)            if rule.pending else "[dim]·[/]",
+                f"[red]{rule.failed}[/]"    if rule.failed  else "[dim]·[/]",
             )
 
 
@@ -173,13 +203,18 @@ class SlurmJobsPanel(Static):
 
     def on_mount(self) -> None:
         dt = self.query_one("#slurm-dt", DataTable)
-        dt.add_columns("Slurm ID", "Rule", "State", "Node", "CPUs", "Mem", "Elapsed")
+        dt.add_columns(
+            "Slurm ID", "Rule", "State", "Node",
+            "CPUs", "Mem", "Timelimit", "Elapsed",
+        )
 
     def refresh_data(self, state: WorkflowState) -> None:
         dt = self.query_one("#slurm-dt", DataTable)
         dt.clear()
 
-        # Sort: running first, then by slurm_id descending
+        pd = state.partition_defaults  # dict[str, PartitionDefaults]
+
+        # Running first, then pending, then terminal states; newest IDs first
         order = {"RUNNING": 0, "COMPLETING": 1, "PENDING": 2}
         jobs = sorted(
             state.slurm_jobs.values(),
@@ -187,16 +222,49 @@ class SlurmJobsPanel(Static):
         )
 
         for job in jobs[:80]:
-            style = _STATE_STYLE.get(job.state, "white")
+            style     = _STATE_STYLE.get(job.state, "white")
+            partition = job.partition
+
+            # Evaluate each resource dimension independently
+            cpus_warn = _cpus_is_default(job.cpus)
+            mem_warn  = _mem_is_default(job.mem_mb, partition, pd)
+            tl_warn   = _timelimit_is_default(job.time_limit_secs, partition, pd)
+
+            cpus_cell = _warn_cell(
+                str(job.cpus) if job.cpus else "-", cpus_warn
+            )
+            mem_cell  = _warn_cell(
+                job.mem_str if job.mem_mb else "-", mem_warn
+            )
+            tl_cell   = _warn_cell(
+                job.time_limit_str if job.time_limit_secs else "-", tl_warn
+            )
+
             dt.add_row(
                 job.slurm_id,
                 job.rule_name,
                 f"[{style}]{job.state_short}[/]",
                 job.node,
-                str(job.cpus) if job.cpus else "-",
-                job.mem_str,
+                cpus_cell,
+                mem_cell,
+                tl_cell,
                 job.elapsed_str,
             )
+
+        # Footer note if any warnings are visible
+        warned = sum(
+            1 for j in jobs[:80]
+            if _cpus_is_default(j.cpus)
+            or _mem_is_default(j.mem_mb, j.partition, pd)
+            or _timelimit_is_default(j.time_limit_secs, j.partition, pd)
+        )
+        title_suffix = (
+            f"  [yellow]⚠ {warned} job(s) may have defaulted[/]"
+            if warned else ""
+        )
+        self.query_one("Label.title").update(
+            f"◈ SLURM JOBS (live){title_suffix}"
+        )
 
 
 class ResourcePanel(Static):
@@ -216,7 +284,7 @@ class ResourcePanel(Static):
 
     def __init__(self, max_cpus: int = 512, max_mem_gb: int = 2048, **kwargs) -> None:
         super().__init__(**kwargs)
-        self.max_cpus = max_cpus
+        self.max_cpus   = max_cpus
         self.max_mem_gb = max_mem_gb
 
     def compose(self) -> ComposeResult:
@@ -224,8 +292,8 @@ class ResourcePanel(Static):
         yield Static("", id="res-content")
 
     def refresh_data(self, state: WorkflowState) -> None:
-        cpus   = state.cpus_in_use
-        mem_gb = state.mem_gb_in_use
+        cpus    = state.cpus_in_use
+        mem_gb  = state.mem_gb_in_use
         n_running = sum(
             1 for j in state.slurm_jobs.values()
             if j.state in ("RUNNING", "COMPLETING")
@@ -234,9 +302,9 @@ class ResourcePanel(Static):
         def _bar(val: float, max_val: float, width: int = 22) -> str:
             if max_val <= 0:
                 return "[dim]" + "░" * width + "[/]"
-            frac = min(1.0, val / max_val)
+            frac  = min(1.0, val / max_val)
             filled = int(width * frac)
-            color = "green" if frac < 0.75 else ("yellow" if frac < 0.9 else "red")
+            color  = "green" if frac < 0.75 else ("yellow" if frac < 0.9 else "red")
             return f"[{color}]{'█' * filled}[/][dim]{'░' * (width - filled)}[/]"
 
         self.query_one("#res-content").update(
@@ -306,9 +374,9 @@ class SmkDashApp(App):
     """
 
     BINDINGS = [
-        Binding("q",     "quit",         "Quit"),
-        Binding("r",     "force_refresh","Refresh"),
-        Binding("ctrl+l","clear_log",    "Clear log"),
+        Binding("q",      "quit",          "Quit"),
+        Binding("r",      "force_refresh", "Refresh"),
+        Binding("ctrl+l", "clear_log",     "Clear log"),
     ]
 
     TITLE = "smk-dash"
@@ -330,10 +398,10 @@ class SmkDashApp(App):
             workflow_name=workflow_name,
         )
         self.poll_interval = poll_interval
-        self.demo_mode = demo_mode
-        self.demo_speed = demo_speed
-        self.max_cpus = max_cpus
-        self.max_mem_gb = max_mem_gb
+        self.demo_mode     = demo_mode
+        self.demo_speed    = demo_speed
+        self.max_cpus      = max_cpus
+        self.max_mem_gb    = max_mem_gb
 
     # ── layout ────────────────────────────────────────────────────────────────
 
@@ -381,16 +449,15 @@ class SmkDashApp(App):
     def _refresh_ui(self) -> None:
         s = self.state
 
-        self.query_one("#overview",    OverviewPanel).refresh_data(s)
-        self.query_one("#rule-table",  RuleTablePanel).refresh_data(s)
-        self.query_one("#slurm-jobs",  SlurmJobsPanel).refresh_data(s)
-        self.query_one("#resources",   ResourcePanel).refresh_data(s)
+        self.query_one("#overview",   OverviewPanel).refresh_data(s)
+        self.query_one("#rule-table", RuleTablePanel).refresh_data(s)
+        self.query_one("#slurm-jobs", SlurmJobsPanel).refresh_data(s)
+        self.query_one("#resources",  ResourcePanel).refresh_data(s)
 
         new_lines = s.drain_new_log_lines()
         if new_lines:
             self.query_one("#log-panel", LogPanel).push_lines(new_lines)
 
-        # Update subtitle with elapsed time
         self.sub_title = f"{s.workflow_name}  ⏱ {s.elapsed_str}"
 
     # ── actions ───────────────────────────────────────────────────────────────

@@ -29,6 +29,8 @@ class SlurmJob:
     cpus: int = 0
     mem_mb: int = 0
     elapsed_secs: int = 0
+    time_limit_secs: int = 0
+    partition: str = ""
 
     @property
     def elapsed_str(self) -> str:
@@ -54,6 +56,13 @@ class SlurmJob:
             "COMPLETED": "DONE",
         }.get(self.state, self.state[:4])
 
+    @property
+    def time_limit_str(self) -> str:            # ← new
+        if not self.time_limit_secs:
+            return "-"
+        h, rem = divmod(self.time_limit_secs, 3600)
+        m = rem // 60
+        return f"{h}:{m:02d}:00"
 
 @dataclass
 class WorkflowState:
